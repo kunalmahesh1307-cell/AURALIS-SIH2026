@@ -1,0 +1,101 @@
+﻿@"
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# Secrets
+.env
+*.key
+*.pem
+
+# Raw datasets / generated audio
+data/
+datasets/
+*.wav
+*.flac
+*.mp3
+
+# Benchmark bulk outputs
+results/benchmark_dfn2/
+results/benchmark_rnnoise/
+results/benchmark_dfn2/**/*
+results/benchmark_rnnoise/**/*
+
+# Keep compact benchmark metadata
+!results/
+!results/README.md
+!results/benchmark/
+!results/benchmark/dfn2_inference_results.json
+!results/benchmark/rnnoise_inference_results.csv
+
+# Demo bulk audio
+demo/audio/
+demo/*.wav
+demo/*.mp3
+demo/*.flac
+
+# Keep selected demo evidence
+!demo/
+!demo/README.md
+!demo/AURALIS_DEMO.py
+!demo/metrics_dashboard.png
+
+# Experimental / temporary files
+*AURALIS_DEMO (1)*
+*_experimental*
+*experimental*
+*_focus.onnx
+*minimal_gru.onnx
+enc_streaming.onnx
+noisy_input.wav
+
+# Development artifacts
+github_pack/
+prepare_AURALIS_GitHub.ps1
+AURALIS_DFN2_vs_RNNoise_Experimental_Evidence.docx
+
+# Third-party source
+third_party/
+
+# Large model artifacts
+*.onnx
+*.pth
+*.pt
+*.ckpt
+
+# Keep documentation/model READMEs
+!models/
+!models/README.md
+!hardware/
+!hardware/README.md
+!docs/
+!docs/**
+
+# OS files
+.DS_Store
+Thumbs.db
+"@ | Set-Content .gitignore
+
+demo/AURALIS_SIH2026_Final_final.pptx
+demo/screenshots/
+results/auralis_demo/
+results/demand_noise_analysis.json
+results/evaluation_dfn2/
+results/evaluation_rnnoise/
+results/mic_noise_benchmark/
+results/part15_gru_focus_results.json
+results/window_benchmark_laptop_local_part12.json
+scripts/
+src/AURALIS_DEMO 1.py
+src/run_mic_noise_benchmark.py

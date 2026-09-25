@@ -1,0 +1,12 @@
+﻿numpy==1.26.4
+scipy==1.13.1
+soundfile
+sounddevice
+pandas
+matplotlib
+psutil
+onnx
+onnxruntime
+DeepFilterNet==0.5.6
+pystoi
+pesq
