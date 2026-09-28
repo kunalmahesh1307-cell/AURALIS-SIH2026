@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>AURALIS Circuit Diagram in 3D</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<style>
+:root{box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);--bg:#0b1820;--ink:#e6f0ee;--panel:rgba(11,24,32,.85)}
+html{height:100%}
+body{margin:0;height:100%;background:var(--bg);color:var(--ink);font-family:Bahnschrift,"Segoe UI",system-ui,sans-serif;overflow:hidden}
+canvas#c{position:fixed;inset:0;width:100%;height:100%;display:block;touch-action:none}
+#cap{position:fixed;left:12px;top:calc(env(safe-area-inset-top,0px) + 10px);max-width:360px;background:var(--panel);border:1px solid #24424a;border-radius:10px;padding:10px 14px;pointer-events:none}
+#cap h1{margin:0 0 2px;font-size:16px}#cap p{margin:0;font-size:13px;color:#9db4b4;line-height:1.4}
+#bar{position:fixed;left:12px;right:12px;bottom:calc(env(safe-area-inset-bottom,0px) + 12px);display:flex;flex-wrap:wrap;gap:8px;justify-content:center}
+button{font:inherit;font-size:13px;color:var(--ink);background:var(--panel);border:1px solid #24424a;border-radius:8px;padding:8px 12px;cursor:pointer}
+button.on{background:#1f6f5c;border-color:#3fd1a5}button:focus-visible{outline:2px solid #f2c14e}
+</style></head><body>
+<canvas id="c"></canvas>
+<div id="cap"><h1 id="t"></h1><p id="d"></p></div>
+<div id="bar"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+const U=40,X=p=>(p-768)/U,Z=p=>(p-512)/U;
+const R=new THREE.WebGLRenderer({canvas:document.getElementById('c'),antialias:true});R.setPixelRatio(Math.min(devicePixelRatio,2));
+const S=new THREE.Scene();S.background=new THREE.Color(0x0b1820);
+const cam=new THREE.PerspectiveCamera(42,1,.1,200);
+S.add(new THREE.HemisphereLight(0xffffff,0x334455,1.05));
+const DL=new THREE.DirectionalLight(0xffffff,.8);DL.position.set(-10,25,8);S.add(DL);
+const M=(c,e)=>new THREE.MeshStandardMaterial({color:c,roughness:.5,metalness:.25,emissive:c,emissiveIntensity:e||0});
+function bx(cx,cy,w,d,h,c,y0,op){const m=M(c,0);if(op){m.transparent=true;m.opacity=op}const o=new THREE.Mesh(new THREE.BoxGeometry(w/U,h,d/U),m);o.position.set(X(cx),(y0||0)+h/2,Z(cy));S.add(o);return o}
+function cy(cx,cy_,r,h,c,y0,horiz){const o=new THREE.Mesh(new THREE.CylinderGeometry(r/U,r/U,h,24),M(c,0));o.position.set(X(cx),(y0||0)+(horiz?r/U:h/2),Z(cy_));if(horiz)o.rotation.z=Math.PI/2;S.add(o);return o}
+function tx(s,cx,cy_,fs,col,y,bold){const c=document.createElement('canvas'),g=c.getContext('2d');const f=(bold?'700 ':'500 ')+'64px Segoe UI,Arial';g.font=f;const lines=s.split('\n');
+ const w=Math.max(...lines.map(l=>g.measureText(l).width))+20,h=lines.length*80;c.width=w;c.height=h;g.font=f;g.fillStyle=col;g.textAlign='center';g.textBaseline='middle';lines.forEach((l,i)=>g.fillText(l,w/2,40+i*80));
+ const sc=fs/64;const p=new THREE.Mesh(new THREE.PlaneGeometry(w*sc/U,h*sc/U),new THREE.MeshBasicMaterial({map:new THREE.CanvasTexture(c),transparent:true,depthWrite:false}));
+ p.rotation.x=-Math.PI/2;p.position.set(X(cx),y||.06,Z(cy_));S.add(p);return p}
+// ground
+bx(768,512,1600,1080,.2,0x0e2530,-.25);
+// panels: id,title,rect,color
+const PN={};
+[['mic','1. MICROPHONE INPUT\n(Analog MEMS)',12,137,380,484,0xdff3d8,196,178],
+ ['codec','2. AUDIO CODEC\n(TI TLV320AIC3104)',395,137,713,572,0xdcebfb,554,165],
+ ['cm5','3. COMPUTE MODULE\n(Raspberry Pi CM5)',815,137,1210,572,0xffd6dc,1012,165],
+ ['emmc','4. STORAGE\n(eMMC)',1273,137,1520,340,0xe6dcf6,1396,165],
+ ['usb','5. USB-C PORT\n(Power + Data)',1326,361,1522,572,0xfff0c8,1424,388],
+ ['jack','6. HEADSET / SPEAKER OUTPUT',16,534,386,712,0xffd6dc,200,554],
+ ['bat','7. BATTERY & POWER MANAGEMENT',16,733,771,984,0xdcebfb,300,754],
+ ['stat','8. STATUS, CONTROL & DEBUG',787,663,1195,838,0xdff3d8,990,684],
+ ['opt','9. OPTIONAL INTERFACES',1222,663,1522,833,0xdcebfb,1372,684]
+].forEach(a=>{const o=bx((a[2]+a[4])/2,(a[3]+a[5])/2,a[4]-a[2],a[5]-a[3],.25,a[6],0);PN[a[0]]=o;
+ tx(a[1],a[7],a[8]+(a[1].includes('\n')?14:0),20,'#1c2b33',.27,true)});
+const Y=.26,N=[];
+function lab(s,x,y,fs){tx(s,x,y,fs||15,'#1c2b33',Y+.02)}
+// --- 1 Microphones
+[[75,250,'Left MIC','(Infineon IM73A135)',262,270,300],[75,390,'Right MIC','(Infineon IM73A135)',380,367,400]].forEach(m=>{
+ cy(m[0],m[1],26,.9,0x8d949a,Y);cy(m[0],m[1],17,.05,0x2b2b2b,Y+.9);
+ lab(m[2]+'\n'+m[3],m[0]+18,m[1]+62,14);
+ bx(290,m[5],50,14,.25,0xc9a26a,Y+.35);cy(332,m[6],13,.7,0x6d8bd6,Y);lab('2.2 kΩ',290,m[5]-22,13);lab('100 nF',358,m[6]+18,12)});
+lab('2.0 V\nMic Bias',332,205,12);lab('MIC_L',240,254,12);lab('MIC_R',240,354,12);
+// --- 2 Codec
+bx(550,315,180,150,.5,0x1b1b1f,Y);
+for(let i=0;i<16;i++){[236,394].forEach(y=>bx(468+i*9.4,y,5,14,.15,0xb9b9b9,Y+.1));}
+for(let i=0;i<14;i++){[458,642].forEach(x=>bx(x,250+i*9.4,14,5,.15,0xb9b9b9,Y+.1));}
+tx('TLV320AIC3104',550,312,17,'#ffffff',Y+.53);tx('TEXAS INSTRUMENTS',560,350,10,'#dddddd',Y+.53);
+['MIC1_P','MIC1_N','MIC2_P','MIC2_N'].forEach((s,i)=>lab(s,425,[250,288,354,396][i]-12,11));
+[[500,494,'HPL',445],[540,538,'HPR',445]].forEach(h=>{cy(h[0],h[1],13,.7,0x2b4f9c,Y);lab('220 µF',h[0]+52,h[1]+2,13);lab(h[2],h[3],h[1]+2,13)});
+// --- 3 CM5
+bx(1000,340,355,290,.18,0x1e8a3d,Y);
+[[850,215],[1180,215],[850,485],[1180,485]].forEach(p=>cy(p[0],p[1],14,.1,0xe1b84a,Y+.18));
+bx(970,330,85,85,.45,0xcfd3d6,Y+.18);bx(1045,262,55,65,.3,0x222,Y+.18);bx(1050,345,55,55,.3,0x222,Y+.18);bx(945,255,50,55,.25,0xcccccc,Y+.18);bx(895,300,20,20,.2,0x333,Y+.18);
+bx(1135,375,75,235,.4,0xd8bd92,Y+.18);tx('CM5 I/O\n(100-pin\nConnectors)',1135,375,11,'#222',Y+.6);
+tx('Raspberry Pi\nCompute Module 5',990,422,17,'#fff',Y+.2);
+// --- 4 eMMC
+bx(1393,242,88,78,.3,0x33363b,Y);tx('eMMC',1393,242,13,'#ddd',Y+.31);lab('32 GB eMMC\n(on CM5)',1393,318,14);
+// --- 5 USB-C
+bx(1425,470,92,54,.45,0xb9bdc4,Y);bx(1425,470,70,24,.47,0x22252a,Y);lab('USB-C\n(Receptacle)',1456,545,14);lab('5 V Input\n(from charger/power bank)',1300,530,11);lab('USB 2.0/3.0\nData',1268,412,12);
+// --- 6 Jack
+bx(170,625,140,80,.7,0x20262b,Y);cy(105,625,22,.7,0xc9a24a,Y+.05,true).rotation.y=Math.PI/2;lab('3.5 mm Headset Jack\n(Headphones / Speaker)',190,690,14);
+// --- 7 Battery / power
+cy(135,850,52,.0,0,0);S.children.pop();
+const bat=cy(135,850,45,210/U,0x2453c9,Y,true);cy(232,850,20,.5,0xc9c9c9,Y,true).scale.set(1,1,1);
+lab('3.7 V Li-ion Battery\n(1-cell, e.g., 3000–5000 mAh)',150,935,14);
+bx(367,860,60,60,.5,0x2b2b2f,Y);lab('Charging IC\n(TI BQ24075)',367,795,14);lab('System 5 V',470,858,12);
+bx(590,875,60,60,.4,0x2b2b2f,Y);lab('3.3 V Buck Regulator\n(TI TPS62840)',590,808,14);lab('3.3 V\n(to CM5, codec,\nperipherals)',715,880,12);
+// --- 8 Status
+cy(833,745,15,.9,0xe23a3a,Y);lab('Status LED\n(GPIO)',833,805,13);
+cy(958,745,32,.5,0x555a60,Y);cy(958,745,20,.3,0x1b1b1b,Y+.5);lab('Mode Button\n(GPIO)',958,805,13);
+bx(1108,765,105,42,.4,0x25282d,Y);lab('Debug UART\n(3.3 V TTL)',1108,815,13);
+// --- 9 Header
+for(let i=0;i<8;i++){bx(1330+i*12,745,9,26,.5,0x2a2a2a,Y);bx(1330+i*12,745,4,4,.9,0xd7b25a,Y)}lab('Service / Expansion Header\n(I2C, GPIO, 5 V, 3.3 V, UART)',1372,800,12);
+// signal labels
+lab('I2S / TDM',755,222,15);lab('I2C Control',755,378,15);['BCLK','LRCLK','SDIN','SDOUT'].forEach((s,i)=>lab(s,742,[243,265,288,311][i]-10,11));lab('SCL',740,392,11);lab('SDA',740,416,11);
+lab('3.3 V',843,596,12);lab('I2C\n(GPIO)',950,602,12);lab('UART\n(Debug)',1048,602,12);lab('USB 2.0/3.0',1170,596,12);
+// --- wires
+const C={red:0xff2d2d,org:0xffa53a,blue:0x1f7bff,grn:0x18b45a,pur:0x8a4dff,blk:0x222831};
+const P=[];
+function wire(st,col,pts,n,rev){const mat=new THREE.MeshBasicMaterial({color:col,transparent:true,opacity:1});const q=pts.map(p=>new THREE.Vector3(X(p[0]),Y+.4,Z(p[1])));let tot=0;const seg=[];
+ for(let i=1;i<q.length;i++){const a=q[i-1],b=q[i],l=a.distanceTo(b);seg.push(l);tot+=l;const m=new THREE.Mesh(new THREE.BoxGeometry(l+.1,.05,.11),mat);m.position.copy(a).lerp(b,.5);m.rotation.y=-Math.atan2(b.z-a.z,b.x-a.x);S.add(m)}
+ const dots=[];for(let i=0;i<(n||3);i++){const d=new THREE.Mesh(new THREE.SphereGeometry(.2,12,12),new THREE.MeshBasicMaterial({color:0xffffff}));S.add(d);dots.push(d)}
+ P.push({st,q,seg,tot,mat,dots,rev,col})}
+wire([1],C.blk,[[105,262],[225,262],[290,270],[332,270],[395,270]],3);
+wire([1],C.blk,[[105,380],[225,380],[290,367],[332,367],[395,367]],3);
+wire([2],C.blue,[[694,243],[836,243]],3);wire([2],C.blue,[[694,265],[836,265]],3);wire([2],C.blue,[[694,311],[836,311]],3);
+wire([4],C.blue,[[836,288],[694,288]],3);
+wire([5],C.grn,[[694,402],[836,402]],3);wire([5],C.grn,[[694,426],[836,426]],3);
+wire([3],C.blk,[[1214,183],[1270,183]],2);
+wire([5],C.pur,[[1216,442],[1322,442]],3);
+wire([0],C.red,[[1322,497],[1216,497]],3);
+wire([4],C.blk,[[502,430],[502,608],[240,608]],4);wire([4],C.blk,[[541,430],[541,630],[240,630]],4);
+wire([0],C.red,[[590,778],[590,638],[868,638],[868,505]],5);
+wire([5],C.blue,[[920,660],[920,505]],3);wire([5],C.grn,[[1012,660],[1012,505]],3);
+wire([5],C.pur,[[1117,505],[1117,625],[1410,625],[1410,662]],5);
+wire([0],C.blk,[[245,868],[325,868]],2);wire([0],C.red,[[405,875],[545,875]],3);wire([0],C.red,[[635,876],[680,876]],2);
+// stages
+const ST=[["Power path","5 V from USB-C and the 3.7 V Li-ion cell go through the BQ24075 charger and the TPS62840 buck to give 3.3 V for the CM5 and codec."],
+["Mic capture","Left and right MEMS mics (2.0 V bias, 2.2 kΩ and 100 nF) feed the MIC1/MIC2 inputs of the codec."],
+["I2S / TDM to CM5","The codec digitizes audio and sends it over BCLK, LRCLK and SDOUT to the Raspberry Pi CM5."],
+["CM5 processing","The CM5 enhances the audio, using the 32 GB eMMC for storage."],
+["Enhanced audio out","Audio returns on SDIN, and the codec drives HPL/HPR through 220 µF caps to the headset jack."],
+["Control and data","I2C configures the codec, USB 2.0/3.0 carries data, and GPIO, UART and the expansion header handle status and debug."]];
+const HP=[['usb','bat','cm5'],['mic','codec'],['codec','cm5'],['cm5','emmc'],['cm5','codec','jack'],['codec','cm5','usb','stat','opt']];
+let stage=0,auto=true,all=true,orbit=false,tS=0,tt=0,th=0,ph=1.02,rad=40;
+const bar=document.getElementById('bar'),btns=[];
+function mk(t,f){const b=document.createElement('button');b.textContent=t;b.onclick=f;bar.appendChild(b);return b}
+ST.forEach((s,i)=>btns.push(mk(s[0],()=>{stage=i;all=false;auto=false;bA.classList.remove('on');bAll.classList.remove('on');ui()})));
+const bAll=mk('All signals',()=>{all=true;auto=false;bA.classList.remove('on');bAll.classList.add('on');ui()});bAll.classList.add('on');
+const bA=mk('Auto tour',()=>{auto=true;all=false;bAll.classList.remove('on');bA.classList.add('on');tS=0;ui()});
+const bO=mk('Slow sway',()=>{orbit=!orbit;bO.classList.toggle('on',orbit)});
+function ui(){document.getElementById('t').textContent=all?'AURALIS Circuit Diagram in 3D':ST[stage][0];
+ document.getElementById('d').textContent=all?'Same layout as your diagram. Drag to rotate, scroll or pinch to zoom, or pick a stage below.':ST[stage][1];btns.forEach((b,i)=>b.classList.toggle('on',!all&&i===stage))}
+ui();
+let drag=null;const cv=document.getElementById('c');
+cv.onpointerdown=e=>drag=[e.clientX,e.clientY];addEventListener('pointerup',()=>drag=null);
+addEventListener('pointermove',e=>{if(!drag)return;th-=(e.clientX-drag[0])*.006;ph=Math.min(1.5,Math.max(.3,ph-(e.clientY-drag[1])*.006));drag=[e.clientX,e.clientY]});
+cv.addEventListener('wheel',e=>{rad=Math.min(70,Math.max(14,rad+e.deltaY*.03));e.preventDefault()},{passive:false});
+function size(){const w=innerWidth,h=innerHeight;R.setSize(w,h,false);cam.aspect=w/h;cam.updateProjectionMatrix();rad=Math.max(38,38*1.6/(w/h))}
+addEventListener('resize',size);size();
+const v=new THREE.Vector3();
+function at(p,u){let d=u*p.tot,i=0;while(i<p.seg.length-1&&d>p.seg[i]){d-=p.seg[i];i++}return v.copy(p.q[i]).lerp(p.q[i+1],Math.min(1,d/p.seg[i]))}
+let last=performance.now();
+function loop(n){const dt=(n-last)/1000;last=n;tt+=dt;
+ if(auto){tS+=dt;if(tS>4.5){tS=0;stage=(stage+1)%6;ui()}}
+ const a=orbit?Math.sin(tt*.35)*.35:0;
+ cam.position.set(Math.sin(th+a)*Math.cos(ph)*rad,Math.sin(ph)*rad,Math.cos(th+a)*Math.cos(ph)*rad+1);cam.lookAt(0,0,1);
+ for(const k in PN){const on=!all&&HP[stage].includes(k);PN[k].material.emissive.setHex(on?0xffffff:0x000000);PN[k].material.emissiveIntensity=on?.18+.12*Math.sin(tt*5):0}
+ for(const p of P){const on=all||p.st.includes(stage);p.mat.opacity=on?1:.15;
+  p.dots.forEach((d,i)=>{d.visible=on;if(on){d.position.copy(at(p,(tt*.25+i/p.dots.length)%1));d.position.y+=.12;d.scale.setScalar(.85+.3*Math.sin(tt*8+i))}})}
+ R.render(S,cam);requestAnimationFrame(loop)}
+requestAnimationFrame(loop);
+</script></body></html>
