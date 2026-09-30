@@ -1,7 +1,11 @@
 import argparse
 import csv
 import time
+import threading
 from pathlib import Path
+
+import tkinter as tk
+from tkinter import ttk
 
 import numpy as np
 import sounddevice as sd
@@ -295,23 +299,134 @@ def print_benchmark():
     print("=" * 72)
 
 
+class LiveDashboard:
+    def __init__(self, noise_type, target_snr, seconds):
+        self.root = tk.Tk()
+        self.root.title("AURALIS — Live Demonstration")
+        self.root.geometry("980x650")
+        self.root.minsize(900, 600)
+        self.root.configure(bg="#0b1220")
+        self.noise_type = noise_type
+        self.target_snr = target_snr
+        self.seconds = seconds
+        self.closed = False
+        self.status_var = tk.StringVar(value="READY — waiting for microphone")
+        self.proc_var = tk.StringVar(value="—")
+        self._build()
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+
+    def _label(self, parent, text, size=12, bold=False, fg="#dbe7ff"):
+        return tk.Label(parent, text=text, bg=parent.cget("bg"), fg=fg,
+                        font=("Segoe UI", size, "bold" if bold else "normal"))
+
+    def _build(self):
+        top = tk.Frame(self.root, bg="#111b2e", padx=22, pady=18)
+        top.pack(fill="x")
+        tk.Label(top, text="AURALIS", bg="#111b2e", fg="#ffffff",
+                 font=("Segoe UI", 25, "bold")).pack(side="left")
+        tk.Label(top, text="  LIVE AI SPEECH ENHANCEMENT",
+                 bg="#111b2e", fg="#79a7ff", font=("Segoe UI", 15, "bold")).pack(side="left", pady=6)
+
+        info = tk.Frame(self.root, bg="#0b1220", padx=22, pady=14)
+        info.pack(fill="x")
+        self._label(info, f"Noise: {self.noise_type.upper()}", 12, True).pack(side="left")
+        self._label(info, f"Target SNR: {self.target_snr:+.0f} dB", 12, True).pack(side="left", padx=35)
+        self._label(info, "Model: DeepFilterNet2", 12, True).pack(side="left")
+
+        cards = tk.Frame(self.root, bg="#0b1220", padx=22)
+        cards.pack(fill="x")
+        self.metrics = {}
+        specs = [("SNR", "dB"), ("STOI", ""), ("PESQ", ""), ("SI-SDR", "dB")]
+        for name, unit in specs:
+            f = tk.Frame(cards, bg="#162238", padx=16, pady=13, highlightthickness=1, highlightbackground="#2b3b5a")
+            f.pack(side="left", expand=True, fill="both", padx=5)
+            tk.Label(f, text=name, bg="#162238", fg="#9fb3d9", font=("Segoe UI", 11, "bold")).pack()
+            value = tk.Label(f, text="—", bg="#162238", fg="#ffffff", font=("Segoe UI", 23, "bold"))
+            value.pack(pady=(6, 0))
+            delta = tk.Label(f, text="Δ —", bg="#162238", fg="#78e6a1", font=("Segoe UI", 11, "bold"))
+            delta.pack()
+            self.metrics[name] = (value, delta, unit)
+
+        detail = tk.Frame(self.root, bg="#0b1220", padx=22, pady=16)
+        detail.pack(fill="x")
+        self._label(detail, "SEGMENT EVALUATION", 12, True, "#79a7ff").pack(anchor="w")
+        self.detail_text = tk.Label(detail, text=(
+            "Metrics are computed after each recorded segment using the original\n"
+            "microphone capture as the reference. They are indicative live-demo\n"
+            "metrics, not the controlled 90-case benchmark."
+        ), bg="#0b1220", fg="#aebdd5", justify="left", font=("Segoe UI", 10))
+        self.detail_text.pack(anchor="w", pady=(7, 0))
+
+        status = tk.Frame(self.root, bg="#111b2e", padx=22, pady=14)
+        status.pack(side="bottom", fill="x")
+        tk.Label(status, textvariable=self.status_var, bg="#111b2e", fg="#7ee2a8",
+                 font=("Segoe UI", 11, "bold")).pack(side="left")
+        tk.Label(status, text="Processing time:", bg="#111b2e", fg="#9fb3d9",
+                 font=("Segoe UI", 10)).pack(side="left", padx=(35, 5))
+        tk.Label(status, textvariable=self.proc_var, bg="#111b2e", fg="#ffffff",
+                 font=("Segoe UI", 10, "bold")).pack(side="left")
+
+    def set_status(self, text):
+        if not self.closed:
+            self.root.after(0, lambda: self.status_var.set(text))
+
+    def set_processing(self, seconds):
+        if not self.closed:
+            self.root.after(0, lambda: self.proc_var.set(f"{seconds:.3f} s"))
+
+    def show_metrics(self, m):
+        vals = {
+            "SNR": (m["output_snr_db"], m["delta_snr_db"]),
+            "STOI": (m["output_stoi"], m["delta_stoi"]),
+            "PESQ": (m["output_pesq"], m["delta_pesq"]),
+            "SI-SDR": (m["output_si_sdr_db"], m["delta_si_sdr_db"]),
+        }
+        def update():
+            for name, (value, delta) in vals.items():
+                v, d, unit = self.metrics[name]
+                if np.isfinite(value):
+                    v.configure(text=f"{value:.2f}" + (f" {unit}" if unit else ""))
+                else:
+                    v.configure(text="N/A")
+                if np.isfinite(delta):
+                    d.configure(text=f"Δ {delta:+.2f}" + (f" {unit}" if unit else ""))
+                else:
+                    d.configure(text="Δ N/A")
+        if not self.closed:
+            self.root.after(0, update)
+
+    def close(self):
+        self.closed = True
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
+    def wait(self):
+        self.root.update_idletasks()
+        self.root.update()
+
+
+def create_dashboard(noise_type, target_snr, seconds):
+    dash = LiveDashboard(noise_type, target_snr, seconds)
+    dash.wait()
+    return dash
+
+
 def print_live_metrics(m):
     print("\n" + "=" * 72)
-    print("LIVE PROTOTYPE — INDICATIVE METRICS")
+    print("LIVE PROTOTYPE — INDICATIVE SEGMENT METRICS")
     print("=" * 72)
-
     print(
-        f"ΔSNR     : {m['delta_snr_db']:+.2f} dB\n"
-        f"ΔSTOI    : {m['delta_stoi']:+.4f}\n"
-        f"ΔPESQ    : {m['delta_pesq']:+.4f}\n"
-        f"ΔSI-SDR  : {m['delta_si_sdr_db']:+.2f} dB"
+        f"Output SNR : {m['output_snr_db']:+.2f} dB  (Δ {m['delta_snr_db']:+.2f} dB)\n"
+        f"Output STOI: {m['output_stoi']:.4f}  (Δ {m['delta_stoi']:+.4f})\n"
+        f"Output PESQ: {m['output_pesq']:.4f}  (Δ {m['delta_pesq']:+.4f})\n"
+        f"Output SI-SDR: {m['output_si_sdr_db']:+.2f} dB  (Δ {m['delta_si_sdr_db']:+.2f} dB)"
     )
-
     print("-" * 72)
-    print("⚠ These use the original microphone recording as reference.")
+    print("⚠ Indicative live-demo evaluation using the original mic recording as reference.")
     print("⚠ Use the controlled 90-case benchmark for quantitative claims.")
     print("=" * 72)
-
 
 def save_report(row):
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -375,6 +490,9 @@ def choose_snr():
 def run_demo(noise_type, target_snr, seconds):
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
+    dashboard = create_dashboard(noise_type, target_snr, seconds)
+    dashboard.set_status("READY — press the terminal prompt when you are ready to record")
+
     print("\n" + "=" * 72)
     print("AURALIS — LIVE AI SPEECH ENHANCEMENT DEMO")
     print("=" * 72)
@@ -384,7 +502,9 @@ def run_demo(noise_type, target_snr, seconds):
     print("=" * 72)
 
     # Record clean-ish microphone speech.
+    dashboard.set_status("● RECORDING MICROPHONE — speak now")
     reference = record(seconds)
+    dashboard.set_status("✓ Recording complete — mixing selected noise")
 
     reference_path = RESULTS_DIR / "demo_mic_reference.wav"
     sf.write(reference_path, reference, MIC_SR)
@@ -412,6 +532,7 @@ def run_demo(noise_type, target_snr, seconds):
     input_48k = RESULTS_DIR / "demo_noisy_48k.wav"
     sf.write(input_48k, noisy_48k, MODEL_SR)
 
+    dashboard.set_status("⚙ AURALIS / DFN2 PROCESSING…")
     print("⚙ Running AURALIS / DFN2...")
 
     start = time.perf_counter()
@@ -444,6 +565,9 @@ def run_demo(noise_type, target_snr, seconds):
     )
     sf.write(enhanced_path, enhanced_16k, MIC_SR)
 
+    dashboard.set_processing(processing_time)
+    dashboard.set_status("✓ Enhancement complete — ready for audio comparison")
+    dashboard.wait()
     print(f"✓ Enhancement complete")
     print(f"Processing time: {processing_time:.3f} s")
 
@@ -465,6 +589,9 @@ def run_demo(noise_type, target_snr, seconds):
         enhanced_16k,
     )
 
+    dashboard.show_metrics(metrics)
+    dashboard.set_status("✓ SEGMENT EVALUATION COMPLETE — metrics shown above")
+    dashboard.wait()
     print_live_metrics(metrics)
 
     # Save report.
@@ -484,6 +611,8 @@ def run_demo(noise_type, target_snr, seconds):
     print(f"Enhanced WAV : {enhanced_path}")
     print(f"Report CSV   : {report}")
     print("=" * 72)
+    input("\nPress ENTER to close the AURALIS dashboard... ")
+    dashboard.close()
 
 
 def main():
