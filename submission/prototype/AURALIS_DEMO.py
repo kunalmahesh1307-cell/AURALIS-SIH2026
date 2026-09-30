@@ -5,42 +5,67 @@ import threading
 from pathlib import Path
 
 import tkinter as tk
-from tkinter import ttk
+from tkinter import messagebox
 
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
+
 from df.enhance import enhance, init_df, load_audio
 
-try:
-    from pystoi import stoi
-except Exception:
-    stoi = None
 
-try:
-    from pesq import pesq
-except Exception:
-    pesq = None
+# ============================================================
+# AURALIS11 — LIVE MICROPHONE SPEECH ENHANCEMENT DEMO
+# ============================================================
+#
+# LIVE MODE:
+#
+# Microphone
+#     ↓
+# User-controlled recording
+#     ↓
+# Original recorded audio
+#     ↓
+# Resample to 48 kHz
+#     ↓
+# DeepFilterNet2
+#     ↓
+# Enhanced audio
+#     ↓
+# Playback
+#
+# IMPORTANT:
+# - No artificial noise is mixed into the microphone input.
+# - Recording continues until the user presses STOP.
+# - There is no fixed recording duration.
+# - Live objective metrics are NOT calculated because no clean
+#   reference signal is available.
+# - Controlled 90-case benchmark remains available separately.
+#
+# ============================================================
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = PROJECT_ROOT / "data"
+
 RESULTS_DIR = PROJECT_ROOT / "results" / "auralis_demo"
 
-NOISE_FILES = {
-    "stationary": DATA_DIR / "noise" / "stationary" / "demand_pstation_stationary.wav",
-    "nonstationary": DATA_DIR / "noise" / "nonstationary" / "demand_straffic_nonstationary.wav",
-    "impulsive": DATA_DIR / "noise" / "impulsive" / "gunshot_fold00.wav",
-}
-
-INPUT_DEVICE = 1
-OUTPUT_DEVICE = 4
 MIC_SR = 16000
 MODEL_SR = 48000
-DEFAULT_SECONDS = 5.0
 
-# Validated controlled-benchmark evidence.
-# These values are NOT calculated from the live microphone recording.
+CHANNELS = 1
+
+# None = use Windows/system default audio device.
+#
+# This makes the demo more portable between computers.
+# If required, these can be changed to numeric device IDs.
+INPUT_DEVICE = None
+OUTPUT_DEVICE = None
+
+
+# ============================================================
+# VALIDATED CONTROLLED BENCHMARK EVIDENCE
+# ============================================================
+
 BENCHMARK = {
     "stationary": {
         "cases": 30,
@@ -75,216 +100,1337 @@ AGGREGATE = {
 }
 
 
-def rms(x):
-    x = np.asarray(x, dtype=np.float64)
-    return float(np.sqrt(np.mean(x * x) + 1e-12))
-
+# ============================================================
+# UTILITY FUNCTIONS
+# ============================================================
 
 def peak_normalize(x, peak=0.98):
+    """
+    Prevent clipping while preserving the original waveform
+    as much as possible.
+    """
     x = np.asarray(x, dtype=np.float32)
+
     if len(x) == 0:
         return x
-    m = np.max(np.abs(x))
-    if m > peak:
-        x = x * (peak / m)
+
+    max_value = np.max(np.abs(x))
+
+    if max_value > peak:
+        x = x * (peak / max_value)
+
     return x
 
 
 def resample_audio(x, src_sr, dst_sr):
+    """
+    Resample mono audio using scipy.signal.resample_poly.
+    """
+
     if src_sr == dst_sr:
         return np.asarray(x, dtype=np.float32)
 
     from math import gcd
     from scipy.signal import resample_poly
 
+    x = np.asarray(x, dtype=np.float32)
+
     g = gcd(int(src_sr), int(dst_sr))
+
     up = int(dst_sr // g)
     down = int(src_sr // g)
 
     return np.asarray(
-        resample_poly(np.asarray(x, dtype=np.float32), up, down),
+        resample_poly(x, up, down),
         dtype=np.float32,
     )
 
 
-def repeat_to_length(x, n):
-    x = np.asarray(x, dtype=np.float32).flatten()
-    if len(x) == 0:
-        raise ValueError("Noise file is empty.")
-    if len(x) >= n:
-        return x[:n]
-    return np.tile(x, int(np.ceil(n / len(x))))[:n]
+def play_audio(path, label):
+    """
+    Play a WAV file through the selected/default output device.
+    """
 
-
-def mix_at_snr(clean, noise, target_snr):
-    clean = np.asarray(clean, dtype=np.float32).flatten()
-    noise = repeat_to_length(noise, len(clean))
-
-    cp = np.mean(clean.astype(np.float64) ** 2) + 1e-12
-    npow = np.mean(noise.astype(np.float64) ** 2) + 1e-12
-    desired_noise_power = cp / (10.0 ** (target_snr / 10.0))
-
-    scale = np.sqrt(desired_noise_power / npow)
-    scaled_noise = noise * np.float32(scale)
-
-    return peak_normalize(clean + scaled_noise), scaled_noise
-
-
-def snr_db(reference, estimate):
-    reference, estimate = align(reference, estimate)
-    noise = estimate.astype(np.float64) - reference.astype(np.float64)
-    reference = reference.astype(np.float64)
-    return 10 * np.log10(
-        (np.sum(reference ** 2) + 1e-12) /
-        (np.sum(noise ** 2) + 1e-12)
-    )
-
-
-def si_sdr(reference, estimate):
-    reference, estimate = align(reference, estimate)
-
-    ref = reference.astype(np.float64)
-    est = estimate.astype(np.float64)
-
-    ref -= np.mean(ref)
-    est -= np.mean(est)
-
-    scale = np.sum(est * ref) / (np.sum(ref ** 2) + 1e-12)
-    target = scale * ref
-    residual = est - target
-
-    return 10 * np.log10(
-        (np.sum(target ** 2) + 1e-12) /
-        (np.sum(residual ** 2) + 1e-12)
-    )
-
-
-def align(a, b):
-    n = min(len(a), len(b))
-    return np.asarray(a[:n], dtype=np.float32), np.asarray(b[:n], dtype=np.float32)
-
-
-def record(seconds):
-    frames = int(seconds * MIC_SR)
-
-    print("\n🎙️  RECORDING")
-    print("Speak clearly into the Airdopes microphone...")
-    print(f"Duration: {seconds:.1f} seconds")
-
-    audio = sd.rec(
-        frames,
-        samplerate=MIC_SR,
-        channels=1,
+    audio, sr = sf.read(
+        path,
         dtype="float32",
-        device=INPUT_DEVICE,
     )
-    sd.wait()
 
-    audio = peak_normalize(audio[:, 0])
-
-    print("✓ Recording complete")
-    return audio
-
-
-def play(path, label):
-    audio, sr = sf.read(path, dtype="float32")
     if audio.ndim > 1:
         audio = audio[:, 0]
 
-    print(f"\n🔊 {label}")
-    sd.play(audio, sr, device=OUTPUT_DEVICE)
+    print()
+    print("=" * 72)
+    print(label)
+    print("=" * 72)
+
+    sd.play(
+        audio,
+        sr,
+        device=OUTPUT_DEVICE,
+    )
+
     sd.wait()
+
     print("✓ Playback complete")
 
 
-def load_noise(noise_type):
-    path = NOISE_FILES[noise_type]
+def save_report(row):
+    """
+    Save demo session information.
+    """
 
-    if not path.exists():
-        raise FileNotFoundError(f"Noise file not found:\n{path}")
-
-    noise, sr = sf.read(path, dtype="float32")
-
-    if noise.ndim > 1:
-        noise = np.mean(noise, axis=1)
-
-    noise = resample_audio(noise, sr, MIC_SR)
-    return peak_normalize(noise), path
-
-
-def calculate_indicative_metrics(reference, noisy, enhanced):
-    reference, noisy = align(reference, noisy)
-    reference2, enhanced = align(reference, enhanced)
-
-    result = {}
-
-    result["input_snr_db"] = snr_db(reference, noisy)
-    result["output_snr_db"] = snr_db(reference2, enhanced)
-    result["delta_snr_db"] = result["output_snr_db"] - result["input_snr_db"]
-
-    if stoi is not None:
-        try:
-            result["input_stoi"] = float(
-                stoi(reference, noisy, MIC_SR, extended=False)
-            )
-            result["output_stoi"] = float(
-                stoi(reference2, enhanced, MIC_SR, extended=False)
-            )
-            result["delta_stoi"] = (
-                result["output_stoi"] - result["input_stoi"]
-            )
-        except Exception:
-            result["input_stoi"] = np.nan
-            result["output_stoi"] = np.nan
-            result["delta_stoi"] = np.nan
-    else:
-        result["input_stoi"] = np.nan
-        result["output_stoi"] = np.nan
-        result["delta_stoi"] = np.nan
-
-    if pesq is not None:
-        try:
-            result["input_pesq"] = float(
-                pesq(MIC_SR, reference, noisy, "wb")
-            )
-            result["output_pesq"] = float(
-                pesq(MIC_SR, reference2, enhanced, "wb")
-            )
-            result["delta_pesq"] = (
-                result["output_pesq"] - result["input_pesq"]
-            )
-        except Exception:
-            result["input_pesq"] = np.nan
-            result["output_pesq"] = np.nan
-            result["delta_pesq"] = np.nan
-    else:
-        result["input_pesq"] = np.nan
-        result["output_pesq"] = np.nan
-        result["delta_pesq"] = np.nan
-
-    result["input_si_sdr_db"] = si_sdr(reference, noisy)
-    result["output_si_sdr_db"] = si_sdr(reference2, enhanced)
-    result["delta_si_sdr_db"] = (
-        result["output_si_sdr_db"] - result["input_si_sdr_db"]
+    RESULTS_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
     )
 
-    return result
+    path = RESULTS_DIR / "auralis_demo_report.csv"
 
+    write_header = not path.exists()
+
+    with path.open(
+        "a",
+        newline="",
+        encoding="utf-8",
+    ) as f:
+
+        writer = csv.DictWriter(
+            f,
+            fieldnames=row.keys(),
+        )
+
+        if write_header:
+            writer.writeheader()
+
+        writer.writerow(row)
+
+    return path
+
+
+# ============================================================
+# LIVE RECORDER
+# ============================================================
+
+class LiveRecorder:
+    """
+    Continuous microphone recorder.
+
+    Recording starts when start() is called and continues
+    until stop() is called.
+
+    There is intentionally NO fixed duration.
+    """
+
+    def __init__(
+        self,
+        samplerate=MIC_SR,
+        channels=CHANNELS,
+        device=INPUT_DEVICE,
+    ):
+
+        self.samplerate = samplerate
+        self.channels = channels
+        self.device = device
+
+        self.stream = None
+
+        self.blocks = []
+
+        self.recording = False
+
+        self.start_time = None
+
+        self.lock = threading.Lock()
+
+    def _callback(
+        self,
+        indata,
+        frames,
+        time_info,
+        status,
+    ):
+
+        if status:
+            print(f"Audio status: {status}")
+
+        if not self.recording:
+            return
+
+        block = np.asarray(
+            indata[:, 0],
+            dtype=np.float32,
+        ).copy()
+
+        with self.lock:
+            self.blocks.append(block)
+
+    def start(self):
+
+        if self.recording:
+            return
+
+        self.blocks = []
+
+        self.recording = True
+
+        self.start_time = time.perf_counter()
+
+        self.stream = sd.InputStream(
+            samplerate=self.samplerate,
+            channels=self.channels,
+            dtype="float32",
+            device=self.device,
+            callback=self._callback,
+            blocksize=0,
+        )
+
+        self.stream.start()
+
+    def stop(self):
+
+        if not self.recording:
+            return np.array([], dtype=np.float32)
+
+        self.recording = False
+
+        if self.stream is not None:
+
+            self.stream.stop()
+            self.stream.close()
+
+            self.stream = None
+
+        with self.lock:
+
+            if not self.blocks:
+                return np.array([], dtype=np.float32)
+
+            audio = np.concatenate(
+                self.blocks
+            ).astype(np.float32)
+
+        return audio
+
+    def duration(self):
+
+        if self.start_time is None:
+            return 0.0
+
+        if not self.recording:
+            return 0.0
+
+        return time.perf_counter() - self.start_time
+
+
+# ============================================================
+# MAIN DASHBOARD
+# ============================================================
+
+class LiveDashboard:
+
+    def __init__(self):
+
+        self.root = tk.Tk()
+
+        self.root.title(
+            "AURALIS11 — Live AI Speech Enhancement"
+        )
+
+        self.root.geometry(
+            "1000x700"
+        )
+
+        self.root.minsize(
+            900,
+            620,
+        )
+
+        self.root.configure(
+            bg="#0b1220"
+        )
+
+        self.closed = False
+
+        self.processing = False
+
+        self.recorder = LiveRecorder()
+
+        self.recording_thread = None
+
+        self.original_path = None
+
+        self.enhanced_path = None
+
+        self.recorded_audio = None
+
+        self._build()
+
+        self.root.protocol(
+            "WM_DELETE_WINDOW",
+            self.close,
+        )
+
+    # --------------------------------------------------------
+    # UI HELPERS
+    # --------------------------------------------------------
+
+    def _label(
+        self,
+        parent,
+        text,
+        size=12,
+        bold=False,
+        fg="#dbe7ff",
+    ):
+
+        return tk.Label(
+            parent,
+            text=text,
+            bg=parent.cget("bg"),
+            fg=fg,
+            font=(
+                "Segoe UI",
+                size,
+                "bold" if bold else "normal",
+            ),
+        )
+
+    # --------------------------------------------------------
+    # BUILD UI
+    # --------------------------------------------------------
+
+    def _build(self):
+
+        # ==============================
+        # HEADER
+        # ==============================
+
+        top = tk.Frame(
+            self.root,
+            bg="#111b2e",
+            padx=24,
+            pady=20,
+        )
+
+        top.pack(
+            fill="x"
+        )
+
+        tk.Label(
+            top,
+            text="AURALIS11",
+            bg="#111b2e",
+            fg="#ffffff",
+            font=(
+                "Segoe UI",
+                27,
+                "bold",
+            ),
+        ).pack(
+            side="left"
+        )
+
+        tk.Label(
+            top,
+            text="  LIVE AI SPEECH ENHANCEMENT",
+            bg="#111b2e",
+            fg="#79a7ff",
+            font=(
+                "Segoe UI",
+                15,
+                "bold",
+            ),
+        ).pack(
+            side="left",
+            pady=7,
+        )
+
+        # ==============================
+        # MODEL INFO
+        # ==============================
+
+        info = tk.Frame(
+            self.root,
+            bg="#0b1220",
+            padx=24,
+            pady=18,
+        )
+
+        info.pack(
+            fill="x"
+        )
+
+        self._label(
+            info,
+            "INPUT: LIVE MICROPHONE",
+            12,
+            True,
+        ).pack(
+            side="left"
+        )
+
+        self._label(
+            info,
+            "MODEL: DeepFilterNet2",
+            12,
+            True,
+        ).pack(
+            side="left",
+            padx=40,
+        )
+
+        self._label(
+            info,
+            "OUTPUT: ENHANCED SPEECH",
+            12,
+            True,
+        ).pack(
+            side="left"
+        )
+
+        # ==============================
+        # RECORDING PANEL
+        # ==============================
+
+        panel = tk.Frame(
+            self.root,
+            bg="#162238",
+            padx=25,
+            pady=25,
+            highlightthickness=1,
+            highlightbackground="#2b3b5a",
+        )
+
+        panel.pack(
+            fill="x",
+            padx=24,
+            pady=10,
+        )
+
+        tk.Label(
+            panel,
+            text="LIVE MICROPHONE INPUT",
+            bg="#162238",
+            fg="#79a7ff",
+            font=(
+                "Segoe UI",
+                13,
+                "bold",
+            ),
+        ).pack()
+
+        self.status_var = tk.StringVar(
+            value="READY — press START RECORDING"
+        )
+
+        tk.Label(
+            panel,
+            textvariable=self.status_var,
+            bg="#162238",
+            fg="#7ee2a8",
+            font=(
+                "Segoe UI",
+                14,
+                "bold",
+            ),
+        ).pack(
+            pady=(12, 8)
+        )
+
+        self.duration_var = tk.StringVar(
+            value="Recording time: 0.0 s"
+        )
+
+        tk.Label(
+            panel,
+            textvariable=self.duration_var,
+            bg="#162238",
+            fg="#c5d3ec",
+            font=(
+                "Segoe UI",
+                11,
+            ),
+        ).pack()
+
+        buttons = tk.Frame(
+            panel,
+            bg="#162238",
+        )
+
+        buttons.pack(
+            pady=(20, 5)
+        )
+
+        self.start_button = tk.Button(
+            buttons,
+            text="●  START RECORDING",
+            command=self.start_recording,
+            bg="#16a34a",
+            fg="white",
+            activebackground="#15803d",
+            activeforeground="white",
+            font=(
+                "Segoe UI",
+                12,
+                "bold",
+            ),
+            padx=22,
+            pady=12,
+            relief="flat",
+            cursor="hand2",
+        )
+
+        self.start_button.pack(
+            side="left",
+            padx=8,
+        )
+
+        self.stop_button = tk.Button(
+            buttons,
+            text="■  STOP RECORDING",
+            command=self.stop_recording,
+            bg="#dc2626",
+            fg="white",
+            activebackground="#b91c1c",
+            activeforeground="white",
+            font=(
+                "Segoe UI",
+                12,
+                "bold",
+            ),
+            padx=22,
+            pady=12,
+            relief="flat",
+            cursor="hand2",
+            state="disabled",
+        )
+
+        self.stop_button.pack(
+            side="left",
+            padx=8,
+        )
+
+        # ==============================
+        # PROCESSING
+        # ==============================
+
+        process_frame = tk.Frame(
+            self.root,
+            bg="#0b1220",
+            padx=24,
+            pady=14,
+        )
+
+        process_frame.pack(
+            fill="x"
+        )
+
+        self.process_button = tk.Button(
+            process_frame,
+            text="⚙  ENHANCE WITH AURALIS11",
+            command=self.start_processing,
+            bg="#2563eb",
+            fg="white",
+            activebackground="#1d4ed8",
+            activeforeground="white",
+            font=(
+                "Segoe UI",
+                13,
+                "bold",
+            ),
+            padx=28,
+            pady=13,
+            relief="flat",
+            cursor="hand2",
+            state="disabled",
+        )
+
+        self.process_button.pack(
+            pady=5
+        )
+
+        # ==============================
+        # AUDIO COMPARISON
+        # ==============================
+
+        comparison = tk.Frame(
+            self.root,
+            bg="#0b1220",
+            padx=24,
+            pady=10,
+        )
+
+        comparison.pack(
+            fill="x"
+        )
+
+        self.play_original_button = tk.Button(
+            comparison,
+            text="▶  PLAY ORIGINAL",
+            command=self.play_original,
+            bg="#334155",
+            fg="white",
+            font=(
+                "Segoe UI",
+                11,
+                "bold",
+            ),
+            padx=18,
+            pady=10,
+            relief="flat",
+            cursor="hand2",
+            state="disabled",
+        )
+
+        self.play_original_button.pack(
+            side="left",
+            expand=True,
+            padx=8,
+        )
+
+        self.play_enhanced_button = tk.Button(
+            comparison,
+            text="▶  PLAY ENHANCED",
+            command=self.play_enhanced,
+            bg="#2563eb",
+            fg="white",
+            font=(
+                "Segoe UI",
+                11,
+                "bold",
+            ),
+            padx=18,
+            pady=10,
+            relief="flat",
+            cursor="hand2",
+            state="disabled",
+        )
+
+        self.play_enhanced_button.pack(
+            side="left",
+            expand=True,
+            padx=8,
+        )
+
+        # ==============================
+        # INFORMATION
+        # ==============================
+
+        detail = tk.Frame(
+            self.root,
+            bg="#0b1220",
+            padx=24,
+            pady=14,
+        )
+
+        detail.pack(
+            fill="x"
+        )
+
+        self._label(
+            detail,
+            "AURALIS11 PROCESSING FLOW",
+            12,
+            True,
+            "#79a7ff",
+        ).pack(
+            anchor="w"
+        )
+
+        tk.Label(
+            detail,
+            text=(
+                "Live microphone → Original audio capture → "
+                "48 kHz processing → DeepFilterNet2 → "
+                "Enhanced speech → Playback"
+            ),
+            bg="#0b1220",
+            fg="#aebdd5",
+            justify="left",
+            font=(
+                "Segoe UI",
+                10,
+            ),
+        ).pack(
+            anchor="w",
+            pady=(7, 0),
+        )
+
+        # ==============================
+        # FOOTER
+        # ==============================
+
+        footer = tk.Frame(
+            self.root,
+            bg="#111b2e",
+            padx=24,
+            pady=14,
+        )
+
+        footer.pack(
+            side="bottom",
+            fill="x",
+        )
+
+        self.processing_var = tk.StringVar(
+            value="Processing time: —"
+        )
+
+        tk.Label(
+            footer,
+            textvariable=self.processing_var,
+            bg="#111b2e",
+            fg="#ffffff",
+            font=(
+                "Segoe UI",
+                10,
+                "bold",
+            ),
+        ).pack(
+            side="left"
+        )
+
+        tk.Label(
+            footer,
+            text=(
+                "AURALIS11 • AI-based digital speech enhancement"
+            ),
+            bg="#111b2e",
+            fg="#9fb3d9",
+            font=(
+                "Segoe UI",
+                9,
+            ),
+        ).pack(
+            side="right"
+        )
+
+    # --------------------------------------------------------
+    # STATUS
+    # --------------------------------------------------------
+
+    def set_status(self, text):
+
+        if not self.closed:
+
+            self.root.after(
+                0,
+                lambda: self.status_var.set(text),
+            )
+
+    # --------------------------------------------------------
+    # RECORDING TIMER
+    # --------------------------------------------------------
+
+    def update_recording_timer(self):
+
+        if self.closed:
+            return
+
+        if self.recorder.recording:
+
+            duration = self.recorder.duration()
+
+            self.duration_var.set(
+                f"Recording time: {duration:.1f} s"
+            )
+
+            self.root.after(
+                100,
+                self.update_recording_timer,
+            )
+
+    # --------------------------------------------------------
+    # START RECORDING
+    # --------------------------------------------------------
+
+    def start_recording(self):
+
+        if self.recorder.recording:
+            return
+
+        try:
+
+            self.original_path = None
+            self.enhanced_path = None
+            self.recorded_audio = None
+
+            self.play_original_button.configure(
+                state="disabled"
+            )
+
+            self.play_enhanced_button.configure(
+                state="disabled"
+            )
+
+            self.process_button.configure(
+                state="disabled"
+            )
+
+            self.start_button.configure(
+                state="disabled"
+            )
+
+            self.stop_button.configure(
+                state="normal"
+            )
+
+            self.set_status(
+                "● RECORDING — speak now. Press STOP when finished."
+            )
+
+            self.duration_var.set(
+                "Recording time: 0.0 s"
+            )
+
+            self.recorder.start()
+
+            self.update_recording_timer()
+
+            print()
+            print("=" * 72)
+            print("AURALIS11 — RECORDING STARTED")
+            print("=" * 72)
+            print(
+                "Speak into the microphone."
+            )
+            print(
+                "There is NO fixed duration."
+            )
+            print(
+                "Press STOP when you finish speaking."
+            )
+            print("=" * 72)
+
+        except Exception as exc:
+
+            self.start_button.configure(
+                state="normal"
+            )
+
+            self.stop_button.configure(
+                state="disabled"
+            )
+
+            self.set_status(
+                "❌ Microphone error"
+            )
+
+            messagebox.showerror(
+                "Microphone Error",
+                str(exc),
+            )
+
+    # --------------------------------------------------------
+    # STOP RECORDING
+    # --------------------------------------------------------
+
+    def stop_recording(self):
+
+        if not self.recorder.recording:
+            return
+
+        try:
+
+            audio = self.recorder.stop()
+
+            if len(audio) == 0:
+
+                self.set_status(
+                    "❌ No audio captured"
+                )
+
+                self.start_button.configure(
+                    state="normal"
+                )
+
+                self.stop_button.configure(
+                    state="disabled"
+                )
+
+                return
+
+            audio = peak_normalize(
+                audio
+            )
+
+            self.recorded_audio = audio
+
+            RESULTS_DIR.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            timestamp = time.strftime(
+                "%Y%m%d_%H%M%S"
+            )
+
+            self.original_path = (
+                RESULTS_DIR /
+                f"original_mic_{timestamp}.wav"
+            )
+
+            sf.write(
+                self.original_path,
+                audio,
+                MIC_SR,
+            )
+
+            duration = len(audio) / MIC_SR
+
+            self.duration_var.set(
+                f"Recording time: {duration:.1f} s"
+            )
+
+            self.set_status(
+                "✓ Recording complete — ready for enhancement"
+            )
+
+            self.start_button.configure(
+                state="normal"
+            )
+
+            self.stop_button.configure(
+                state="disabled"
+            )
+
+            self.process_button.configure(
+                state="normal"
+            )
+
+            self.play_original_button.configure(
+                state="normal"
+            )
+
+            print()
+            print("=" * 72)
+            print("AURALIS11 — RECORDING COMPLETE")
+            print("=" * 72)
+            print(
+                f"Duration: {duration:.2f} seconds"
+            )
+            print(
+                f"Saved: {self.original_path}"
+            )
+            print("=" * 72)
+
+        except Exception as exc:
+
+            self.start_button.configure(
+                state="normal"
+            )
+
+            self.stop_button.configure(
+                state="disabled"
+            )
+
+            self.set_status(
+                "❌ Recording failed"
+            )
+
+            messagebox.showerror(
+                "Recording Error",
+                str(exc),
+            )
+
+    # --------------------------------------------------------
+    # START ENHANCEMENT
+    # --------------------------------------------------------
+
+    def start_processing(self):
+
+        if self.recorded_audio is None:
+            return
+
+        if self.processing:
+            return
+
+        self.processing = True
+
+        self.process_button.configure(
+            state="disabled"
+        )
+
+        self.start_button.configure(
+            state="disabled"
+        )
+
+        self.play_original_button.configure(
+            state="disabled"
+        )
+
+        self.play_enhanced_button.configure(
+            state="disabled"
+        )
+
+        self.set_status(
+            "⚙ Loading DeepFilterNet2..."
+        )
+
+        self.recording_thread = threading.Thread(
+            target=self._process_audio,
+            daemon=True,
+        )
+
+        self.recording_thread.start()
+
+    # --------------------------------------------------------
+    # PROCESS AUDIO
+    # --------------------------------------------------------
+
+    def _process_audio(self):
+
+        try:
+
+            RESULTS_DIR.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            print()
+            print("=" * 72)
+            print("AURALIS11 — DEEPFILTERNET2 ENHANCEMENT")
+            print("=" * 72)
+
+            print(
+                "Loading DeepFilterNet2..."
+            )
+
+            model, df_state, _ = init_df(
+                "DeepFilterNet2"
+            )
+
+            model_sr = df_state.sr()
+
+            print(
+                f"Model sample rate: {model_sr} Hz"
+            )
+
+            # ---------------------------------------------
+            # Resample microphone audio to model rate
+            # ---------------------------------------------
+
+            input_48k = resample_audio(
+                self.recorded_audio,
+                MIC_SR,
+                MODEL_SR,
+            )
+
+            timestamp = time.strftime(
+                "%Y%m%d_%H%M%S"
+            )
+
+            model_input_path = (
+                RESULTS_DIR /
+                f"model_input_{timestamp}.wav"
+            )
+
+            sf.write(
+                model_input_path,
+                input_48k,
+                MODEL_SR,
+            )
+
+            self.set_status(
+                "⚙ AURALIS11 / DFN2 processing..."
+            )
+
+            print(
+                "Running DeepFilterNet2..."
+            )
+
+            start = time.perf_counter()
+
+            model_audio, _ = load_audio(
+                str(model_input_path),
+                sr=df_state.sr(),
+            )
+
+            enhanced_48k = enhance(
+                model,
+                df_state,
+                model_audio,
+            )
+
+            processing_time = (
+                time.perf_counter() - start
+            )
+
+            # ---------------------------------------------
+            # Convert enhanced audio back to 16 kHz
+            # ---------------------------------------------
+
+            enhanced_16k = resample_audio(
+                np.asarray(
+                    enhanced_48k,
+                    dtype=np.float32,
+                ).flatten(),
+                MODEL_SR,
+                MIC_SR,
+            )
+
+            enhanced_16k = peak_normalize(
+                enhanced_16k
+            )
+
+            self.enhanced_path = (
+                RESULTS_DIR /
+                f"enhanced_mic_{timestamp}.wav"
+            )
+
+            sf.write(
+                self.enhanced_path,
+                enhanced_16k,
+                MIC_SR,
+            )
+
+            duration = (
+                len(self.recorded_audio) /
+                MIC_SR
+            )
+
+            rtf = (
+                processing_time /
+                duration
+                if duration > 0
+                else np.nan
+            )
+
+            self.processing = False
+
+            self.root.after(
+                0,
+                lambda: self._processing_complete(
+                    processing_time,
+                    rtf,
+                ),
+            )
+
+            print()
+            print("=" * 72)
+            print("AURALIS11 — ENHANCEMENT COMPLETE")
+            print("=" * 72)
+            print(
+                f"Audio duration : {duration:.2f} s"
+            )
+            print(
+                f"Processing time: {processing_time:.3f} s"
+            )
+            print(
+                f"Session RTF    : {rtf:.4f}"
+            )
+            print(
+                f"Enhanced file  : {self.enhanced_path}"
+            )
+            print("=" * 72)
+
+        except Exception as exc:
+
+            self.processing = False
+
+            self.root.after(
+                0,
+                lambda: self._processing_failed(
+                    exc
+                ),
+            )
+
+    # --------------------------------------------------------
+    # PROCESSING COMPLETE
+    # --------------------------------------------------------
+
+    def _processing_complete(
+        self,
+        processing_time,
+        rtf,
+    ):
+
+        self.processing_var.set(
+            f"Processing time: {processing_time:.3f} s   |   Session RTF: {rtf:.4f}"
+        )
+
+        self.set_status(
+            "✓ Enhancement complete — compare original and enhanced audio"
+        )
+
+        self.start_button.configure(
+            state="normal"
+        )
+
+        self.process_button.configure(
+            state="normal"
+        )
+
+        self.play_original_button.configure(
+            state="normal"
+        )
+
+        self.play_enhanced_button.configure(
+            state="normal"
+        )
+
+    # --------------------------------------------------------
+    # PROCESSING FAILED
+    # --------------------------------------------------------
+
+    def _processing_failed(
+        self,
+        exc,
+    ):
+
+        self.set_status(
+            "❌ Enhancement failed"
+        )
+
+        self.start_button.configure(
+            state="normal"
+        )
+
+        self.process_button.configure(
+            state="normal"
+        )
+
+        messagebox.showerror(
+            "AURALIS11 Processing Error",
+            str(exc),
+        )
+
+    # --------------------------------------------------------
+    # PLAY ORIGINAL
+    # --------------------------------------------------------
+
+    def play_original(self):
+
+        if self.original_path is None:
+            return
+
+        try:
+
+            self.set_status(
+                "▶ Playing original microphone audio..."
+            )
+
+            play_audio(
+                self.original_path,
+                "ORIGINAL MICROPHONE AUDIO",
+            )
+
+            self.set_status(
+                "✓ Original playback complete"
+            )
+
+        except Exception as exc:
+
+            messagebox.showerror(
+                "Playback Error",
+                str(exc),
+            )
+
+    # --------------------------------------------------------
+    # PLAY ENHANCED
+    # --------------------------------------------------------
+
+    def play_enhanced(self):
+
+        if self.enhanced_path is None:
+            return
+
+        try:
+
+            self.set_status(
+                "▶ Playing AURALIS11 enhanced audio..."
+            )
+
+            play_audio(
+                self.enhanced_path,
+                "AURALIS11 ENHANCED AUDIO",
+            )
+
+            self.set_status(
+                "✓ Enhanced playback complete"
+            )
+
+        except Exception as exc:
+
+            messagebox.showerror(
+                "Playback Error",
+                str(exc),
+            )
+
+    # --------------------------------------------------------
+    # CLOSE
+    # --------------------------------------------------------
+
+    def close(self):
+
+        self.closed = True
+
+        try:
+
+            if self.recorder.recording:
+                self.recorder.stop()
+
+        except Exception:
+            pass
+
+        try:
+
+            sd.stop()
+
+        except Exception:
+            pass
+
+        try:
+
+            self.root.destroy()
+
+        except Exception:
+            pass
+
+    # --------------------------------------------------------
+    # RUN
+    # --------------------------------------------------------
+
+    def run(self):
+
+        self.root.mainloop()
+
+
+# ============================================================
+# BENCHMARK DISPLAY
+# ============================================================
 
 def print_benchmark():
-    print("\n" + "=" * 72)
-    print("VALIDATED AURALIS BENCHMARK EVIDENCE — 90 CASES")
+
+    print()
     print("=" * 72)
     print(
-        f"Aggregate ΔSNR     : {AGGREGATE['snr']:+.2f} dB\n"
-        f"Aggregate ΔSTOI    : {AGGREGATE['stoi']:+.4f}\n"
-        f"Aggregate ΔPESQ    : {AGGREGATE['pesq']:+.4f}\n"
-        f"Aggregate ΔSI-SDR  : {AGGREGATE['si_sdr']:+.2f} dB\n"
-        f"Offline RTF        : {AGGREGATE['rtf']:.4f}"
+        "VALIDATED AURALIS11 BENCHMARK EVIDENCE — 90 CASES"
     )
+    print("=" * 72)
+
+    print(
+        f"Aggregate ΔSNR     : "
+        f"{AGGREGATE['snr']:+.2f} dB\n"
+
+        f"Aggregate ΔSTOI    : "
+        f"{AGGREGATE['stoi']:+.4f}\n"
+
+        f"Aggregate ΔPESQ    : "
+        f"{AGGREGATE['pesq']:+.4f}\n"
+
+        f"Aggregate ΔSI-SDR  : "
+        f"{AGGREGATE['si_sdr']:+.2f} dB\n"
+
+        f"Offline RTF        : "
+        f"{AGGREGATE['rtf']:.4f}"
+    )
+
     print("-" * 72)
 
     for name, values in BENCHMARK.items():
+
         print(
             f"{name:13s} | "
             f"ΔSNR {values['snr']:+6.2f} dB | "
@@ -294,381 +1440,147 @@ def print_benchmark():
         )
 
     print("=" * 72)
-    print("Source: controlled 90-case AURALIS/DFN2 benchmark.")
-    print("These are separate from the live microphone prototype metrics.")
-    print("=" * 72)
 
-
-class LiveDashboard:
-    def __init__(self, noise_type, target_snr, seconds):
-        self.root = tk.Tk()
-        self.root.title("AURALIS — Live Demonstration")
-        self.root.geometry("980x650")
-        self.root.minsize(900, 600)
-        self.root.configure(bg="#0b1220")
-        self.noise_type = noise_type
-        self.target_snr = target_snr
-        self.seconds = seconds
-        self.closed = False
-        self.status_var = tk.StringVar(value="READY — waiting for microphone")
-        self.proc_var = tk.StringVar(value="—")
-        self._build()
-        self.root.protocol("WM_DELETE_WINDOW", self.close)
-
-    def _label(self, parent, text, size=12, bold=False, fg="#dbe7ff"):
-        return tk.Label(parent, text=text, bg=parent.cget("bg"), fg=fg,
-                        font=("Segoe UI", size, "bold" if bold else "normal"))
-
-    def _build(self):
-        top = tk.Frame(self.root, bg="#111b2e", padx=22, pady=18)
-        top.pack(fill="x")
-        tk.Label(top, text="AURALIS", bg="#111b2e", fg="#ffffff",
-                 font=("Segoe UI", 25, "bold")).pack(side="left")
-        tk.Label(top, text="  LIVE AI SPEECH ENHANCEMENT",
-                 bg="#111b2e", fg="#79a7ff", font=("Segoe UI", 15, "bold")).pack(side="left", pady=6)
-
-        info = tk.Frame(self.root, bg="#0b1220", padx=22, pady=14)
-        info.pack(fill="x")
-        self._label(info, f"Noise: {self.noise_type.upper()}", 12, True).pack(side="left")
-        self._label(info, f"Target SNR: {self.target_snr:+.0f} dB", 12, True).pack(side="left", padx=35)
-        self._label(info, "Model: DeepFilterNet2", 12, True).pack(side="left")
-
-        cards = tk.Frame(self.root, bg="#0b1220", padx=22)
-        cards.pack(fill="x")
-        self.metrics = {}
-        specs = [("SNR", "dB"), ("STOI", ""), ("PESQ", ""), ("SI-SDR", "dB")]
-        for name, unit in specs:
-            f = tk.Frame(cards, bg="#162238", padx=16, pady=13, highlightthickness=1, highlightbackground="#2b3b5a")
-            f.pack(side="left", expand=True, fill="both", padx=5)
-            tk.Label(f, text=name, bg="#162238", fg="#9fb3d9", font=("Segoe UI", 11, "bold")).pack()
-            value = tk.Label(f, text="—", bg="#162238", fg="#ffffff", font=("Segoe UI", 23, "bold"))
-            value.pack(pady=(6, 0))
-            delta = tk.Label(f, text="Δ —", bg="#162238", fg="#78e6a1", font=("Segoe UI", 11, "bold"))
-            delta.pack()
-            self.metrics[name] = (value, delta, unit)
-
-        detail = tk.Frame(self.root, bg="#0b1220", padx=22, pady=16)
-        detail.pack(fill="x")
-        self._label(detail, "SEGMENT EVALUATION", 12, True, "#79a7ff").pack(anchor="w")
-        self.detail_text = tk.Label(detail, text=(
-            "Metrics are computed after each recorded segment using the original\n"
-            "microphone capture as the reference. They are indicative live-demo\n"
-            "metrics, not the controlled 90-case benchmark."
-        ), bg="#0b1220", fg="#aebdd5", justify="left", font=("Segoe UI", 10))
-        self.detail_text.pack(anchor="w", pady=(7, 0))
-
-        status = tk.Frame(self.root, bg="#111b2e", padx=22, pady=14)
-        status.pack(side="bottom", fill="x")
-        tk.Label(status, textvariable=self.status_var, bg="#111b2e", fg="#7ee2a8",
-                 font=("Segoe UI", 11, "bold")).pack(side="left")
-        tk.Label(status, text="Processing time:", bg="#111b2e", fg="#9fb3d9",
-                 font=("Segoe UI", 10)).pack(side="left", padx=(35, 5))
-        tk.Label(status, textvariable=self.proc_var, bg="#111b2e", fg="#ffffff",
-                 font=("Segoe UI", 10, "bold")).pack(side="left")
-
-    def set_status(self, text):
-        if not self.closed:
-            self.root.after(0, lambda: self.status_var.set(text))
-
-    def set_processing(self, seconds):
-        if not self.closed:
-            self.root.after(0, lambda: self.proc_var.set(f"{seconds:.3f} s"))
-
-    def show_metrics(self, m):
-        vals = {
-            "SNR": (m["output_snr_db"], m["delta_snr_db"]),
-            "STOI": (m["output_stoi"], m["delta_stoi"]),
-            "PESQ": (m["output_pesq"], m["delta_pesq"]),
-            "SI-SDR": (m["output_si_sdr_db"], m["delta_si_sdr_db"]),
-        }
-        def update():
-            for name, (value, delta) in vals.items():
-                v, d, unit = self.metrics[name]
-                if np.isfinite(value):
-                    v.configure(text=f"{value:.2f}" + (f" {unit}" if unit else ""))
-                else:
-                    v.configure(text="N/A")
-                if np.isfinite(delta):
-                    d.configure(text=f"Δ {delta:+.2f}" + (f" {unit}" if unit else ""))
-                else:
-                    d.configure(text="Δ N/A")
-        if not self.closed:
-            self.root.after(0, update)
-
-    def close(self):
-        self.closed = True
-        try:
-            self.root.destroy()
-        except Exception:
-            pass
-
-    def wait(self):
-        self.root.update_idletasks()
-        self.root.update()
-
-
-def create_dashboard(noise_type, target_snr, seconds):
-    dash = LiveDashboard(noise_type, target_snr, seconds)
-    dash.wait()
-    return dash
-
-
-def print_live_metrics(m):
-    print("\n" + "=" * 72)
-    print("LIVE PROTOTYPE — INDICATIVE SEGMENT METRICS")
-    print("=" * 72)
     print(
-        f"Output SNR : {m['output_snr_db']:+.2f} dB  (Δ {m['delta_snr_db']:+.2f} dB)\n"
-        f"Output STOI: {m['output_stoi']:.4f}  (Δ {m['delta_stoi']:+.4f})\n"
-        f"Output PESQ: {m['output_pesq']:.4f}  (Δ {m['delta_pesq']:+.4f})\n"
-        f"Output SI-SDR: {m['output_si_sdr_db']:+.2f} dB  (Δ {m['delta_si_sdr_db']:+.2f} dB)"
+        "Source: controlled 90-case AURALIS11/DFN2 benchmark."
     )
-    print("-" * 72)
-    print("⚠ Indicative live-demo evaluation using the original mic recording as reference.")
-    print("⚠ Use the controlled 90-case benchmark for quantitative claims.")
+
+    print(
+        "These values are separate from the live microphone demo."
+    )
+
     print("=" * 72)
 
-def save_report(row):
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    path = RESULTS_DIR / "auralis_demo_report.csv"
 
-    write_header = not path.exists()
+# ============================================================
+# DEVICE INFORMATION
+# ============================================================
 
-    with path.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=row.keys())
-        if write_header:
-            writer.writeheader()
-        writer.writerow(row)
+def print_audio_devices():
 
-    return path
-
-
-def choose_noise():
-    print("\n" + "=" * 55)
-    print("SELECT NOISE CLASS")
-    print("=" * 55)
-    print("1. Stationary")
-    print("2. Non-stationary")
-    print("3. Impulsive / Gunshot-like")
-    print("4. Exit")
-    print("=" * 55)
-
-    while True:
-        choice = input("Select [1-4]: ").strip()
-
-        if choice == "1":
-            return "stationary"
-        if choice == "2":
-            return "nonstationary"
-        if choice == "3":
-            return "impulsive"
-        if choice == "4":
-            return None
-
-        print("Invalid choice. Enter 1, 2, 3 or 4.")
-
-
-def choose_snr():
-    print("\nSELECT TARGET SNR")
-    print("1. +5 dB")
-    print("2.  0 dB")
-    print("3. -5 dB")
-
-    while True:
-        choice = input("Select [1-3]: ").strip()
-
-        if choice == "1":
-            return 5.0
-        if choice == "2":
-            return 0.0
-        if choice == "3":
-            return -5.0
-
-        print("Invalid choice. Enter 1, 2 or 3.")
-
-
-def run_demo(noise_type, target_snr, seconds):
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-
-    dashboard = create_dashboard(noise_type, target_snr, seconds)
-    dashboard.set_status("READY — press the terminal prompt when you are ready to record")
-
-    print("\n" + "=" * 72)
-    print("AURALIS — LIVE AI SPEECH ENHANCEMENT DEMO")
+    print()
     print("=" * 72)
-    print(f"Noise       : {noise_type}")
-    print(f"Target SNR  : {target_snr:+.0f} dB")
-    print(f"Duration    : {seconds:.1f} s")
+    print("AVAILABLE AUDIO DEVICES")
     print("=" * 72)
 
-    # Record clean-ish microphone speech.
-    dashboard.set_status("● RECORDING MICROPHONE — speak now")
-    reference = record(seconds)
-    dashboard.set_status("✓ Recording complete — mixing selected noise")
+    try:
 
-    reference_path = RESULTS_DIR / "demo_mic_reference.wav"
-    sf.write(reference_path, reference, MIC_SR)
+        devices = sd.query_devices()
 
-    # Mix selected noise.
-    noise, noise_path = load_noise(noise_type)
-    noisy, _ = mix_at_snr(reference, noise, target_snr)
+        for index, device in enumerate(devices):
 
-    noisy_path = (
-        RESULTS_DIR /
-        f"noisy_{noise_type}_{target_snr:+.0f}dB.wav"
-    )
-    sf.write(noisy_path, noisy, MIC_SR)
+            print(
+                f"[{index}] "
+                f"{device['name']} | "
+                f"inputs={device['max_input_channels']} | "
+                f"outputs={device['max_output_channels']}"
+            )
 
-    print(f"\nNoise source: {noise_path}")
-    print(f"Saved noisy:  {noisy_path}")
+    except Exception as exc:
 
-    # Load DFN2 once for this demo.
-    print("\n🧠 Loading DeepFilterNet2...")
-    model, df_state, _ = init_df("DeepFilterNet2")
+        print(
+            "Could not enumerate audio devices:"
+        )
 
-    # DFN2 operates at 48 kHz.
-    noisy_48k = resample_audio(noisy, MIC_SR, MODEL_SR)
+        print(exc)
 
-    input_48k = RESULTS_DIR / "demo_noisy_48k.wav"
-    sf.write(input_48k, noisy_48k, MODEL_SR)
-
-    dashboard.set_status("⚙ AURALIS / DFN2 PROCESSING…")
-    print("⚙ Running AURALIS / DFN2...")
-
-    start = time.perf_counter()
-
-    model_audio, _ = load_audio(
-        str(input_48k),
-        sr=df_state.sr(),
-    )
-
-    enhanced_48k = enhance(
-        model,
-        df_state,
-        model_audio,
-    )
-
-    processing_time = time.perf_counter() - start
-
-    enhanced_16k = resample_audio(
-        np.asarray(enhanced_48k, dtype=np.float32).flatten(),
-        MODEL_SR,
-        MIC_SR,
-    )
-
-    enhanced_16k, reference = align(enhanced_16k, reference)
-    enhanced_16k = peak_normalize(enhanced_16k)
-
-    enhanced_path = (
-        RESULTS_DIR /
-        f"enhanced_{noise_type}_{target_snr:+.0f}dB.wav"
-    )
-    sf.write(enhanced_path, enhanced_16k, MIC_SR)
-
-    dashboard.set_processing(processing_time)
-    dashboard.set_status("✓ Enhancement complete — ready for audio comparison")
-    dashboard.wait()
-    print(f"✓ Enhancement complete")
-    print(f"Processing time: {processing_time:.3f} s")
-
-    # Playback.
-    print("\n" + "=" * 72)
-    print("AUDIO COMPARISON")
     print("=" * 72)
 
-    input("Press ENTER to play NOISY audio... ")
-    play(noisy_path, "NOISY AUDIO")
 
-    input("Press ENTER to play AURALIS ENHANCED audio... ")
-    play(enhanced_path, "AURALIS ENHANCED AUDIO")
-
-    # Live indicative metrics.
-    metrics = calculate_indicative_metrics(
-        reference,
-        noisy,
-        enhanced_16k,
-    )
-
-    dashboard.show_metrics(metrics)
-    dashboard.set_status("✓ SEGMENT EVALUATION COMPLETE — metrics shown above")
-    dashboard.wait()
-    print_live_metrics(metrics)
-
-    # Save report.
-    row = {
-        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "noise_type": noise_type,
-        "target_snr_db": target_snr,
-        "processing_time_sec": processing_time,
-        **metrics,
-    }
-
-    report = save_report(row)
-
-    print("\n" + "=" * 72)
-    print("DEMO COMPLETE")
-    print("=" * 72)
-    print(f"Enhanced WAV : {enhanced_path}")
-    print(f"Report CSV   : {report}")
-    print("=" * 72)
-    input("\nPress ENTER to close the AURALIS dashboard... ")
-    dashboard.close()
-
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
+
     parser = argparse.ArgumentParser(
-        description="Interactive AURALIS SIH prototype demo."
+        description=(
+            "AURALIS11 live microphone speech enhancement demo."
+        )
     )
-    parser.add_argument("--noise", choices=list(NOISE_FILES.keys()))
-    parser.add_argument("--snr", type=float, choices=[5.0, 0.0, -5.0])
-    parser.add_argument("--seconds", type=float, default=DEFAULT_SECONDS)
-    parser.add_argument("--benchmark", action="store_true")
+
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help=(
+            "Display validated 90-case benchmark evidence."
+        ),
+    )
+
+    parser.add_argument(
+        "--devices",
+        action="store_true",
+        help=(
+            "List available audio input/output devices."
+        ),
+    )
+
     args = parser.parse_args()
 
     if args.benchmark:
+
         print_benchmark()
+
         return
 
-    if args.noise is not None and args.snr is not None:
-        run_demo(args.noise, args.snr, args.seconds)
+    if args.devices:
+
+        print_audio_devices()
+
         return
 
-    print("\n" + "=" * 72)
-    print("        A U R A L I S  —  SIH 2026 DEMO")
+    print()
     print("=" * 72)
-    print("AI-based Adaptive Digital Speech Enhancement")
-    print("Stationary • Non-stationary • Impulsive Noise")
+    print(
+        "        A U R A L I S 1 1"
+    )
+    print(
+        "        SIH 2026 LIVE DEMO"
+    )
     print("=" * 72)
 
-    while True:
-        noise_type = choose_noise()
+    print(
+        "AI-based Adaptive Digital Speech Enhancement"
+    )
 
-        if noise_type is None:
-            print("\nExiting AURALIS demo.")
-            return
+    print(
+        "Live microphone → DeepFilterNet2 → Enhanced speech"
+    )
 
-        target_snr = choose_snr()
+    print("=" * 72)
 
-        try:
-            run_demo(
-                noise_type,
-                target_snr,
-                args.seconds,
-            )
-        except KeyboardInterrupt:
-            print("\n\nDemo interrupted.")
-            return
-        except Exception as exc:
-            print("\n❌ Demo failed:")
-            print(exc)
-            print("\nCheck microphone/output devices and input files.")
+    print()
+    print(
+        "Audio input/output devices:"
+    )
 
-        again = input("\nRun another demo? [y/N]: ").strip().lower()
+    print(
+        "Input device :",
+        "System default"
+        if INPUT_DEVICE is None
+        else INPUT_DEVICE,
+    )
 
-        if again != "y":
-            print("\nAURALIS demo finished.")
-            return
+    print(
+        "Output device:",
+        "System default"
+        if OUTPUT_DEVICE is None
+        else OUTPUT_DEVICE,
+    )
 
+    print()
+    print(
+        "Starting AURALIS11 dashboard..."
+    )
+
+    dashboard = LiveDashboard()
+
+    dashboard.run()
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
     main()
